@@ -1,14 +1,25 @@
+import './App.css';
 import React from 'react';
-import { createRoot } from 'react-dom/client';
-import Signup from './Signup.jsx';
+import { BrowserRouter as Router, Routes, Route, Navigate } from 'react-router-dom';
+import SignupPage from './Signup';
+import MedicalTracking from './MedicalTracking';
 
 function App() {
-  return <Signup />;
+  return (
+    <Router>
+      <div className="App">
+        <Routes>
+          {/* Auth Flow */}
+          <Route path="/" element={<SignupPage />} />
+          <Route path="/signup" element={<SignupPage />} />
+          <Route path="/medical-tracking" element={<MedicalTracking />} />
+          
+          {/* Fallback */}
+          <Route path="*" element={<Navigate to="/" replace />} />
+        </Routes>
+      </div>
+    </Router>
+  );
 }
 
-const container = document.getElementById('root');
-const root = createRoot(container);
-root.render(<App />);
-
-export default App;  // ← ADD THIS LINE
-
+export default App;
