@@ -1,6 +1,11 @@
 from fastapi import FastAPI, HTTPException
 from sqlalchemy import create_engine, MetaData, Table, select
 import os
+from pydantic import BaseModel
+# from agents.pharmacist_agent import extract_keywords, pharmacist_agent
+import sqlite3
+
+# from agents.pharmacist_agent import extract_keywords
 
 app = FastAPI()
 
@@ -41,6 +46,35 @@ def read_orders():
         query = select(orders_table)
         result = conn.execute(query)
         return [dict(row._mapping) for row in result]
+    
+class ChatRequest(BaseModel):
+    message: str
+
+# --- Input Schema ---
+class UserQuery(BaseModel):
+    query: str
+
+def query_db(search_term: str): 
+    conn = sqlite3.connect(DATABASE_URL) 
+    cursor = conn.cursor()
+
+# --- Pharmacist Agent Endpoint ---
+# @app.post("/pharmacist")
+# def pharmacist_agent(user_query: UserQuery):
+#     # Step 1: Extract keywords from messy input
+#     keywords = extract_keywords(user_query.query)
+
+#     # Step 2: Query DB for each keyword
+#     all_results = []
+#     for kw in keywords:
+#         matches = query_db(kw)
+#         all_results.extend(matches)
+
+#     # Step 3: Return results
+#     if not all_results:
+#         return {"message": "No matching medicines found."}
+#     return {"matches": all_results}
+
 
 @app.get("/patient/{patient_id}/history")
 def get_patient_history(patient_id: str):
