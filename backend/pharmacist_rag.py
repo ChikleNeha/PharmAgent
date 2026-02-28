@@ -1,95 +1,93 @@
 import asyncio
 import pandas as pd
-from typing import List, TypedDict
+from typing import List, TypedDict, Annotated
+from pydantic import BaseModel, Field
 from langchain_ollama import ChatOllama, OllamaEmbeddings
 from langchain_community.document_loaders import DataFrameLoader
 from langchain_chroma import Chroma 
 from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.output_parsers import StrOutputParser
 from langgraph.graph import START, StateGraph
 from dotenv import load_dotenv
 
 load_dotenv()
 
-# --- 1. DATA INGESTION ---
+# --- 1. STRUCTURED SCHEMA ---
+class ProductSelection(BaseModel):
+    """List of product PZNs recommended to the user."""
+    pzn_list: List[int] = Field(description="The unique PZN numbers of the medications found in the context.")
+    reasoning: str = Field(description="Brief explanation of why these were chosen.")
+
+# --- 2. DATA INGESTION ---
 excel_file = "data/eng-products-export.xlsx" 
 df = pd.read_excel(excel_file)
 df['search_text'] = df.apply(
-    lambda x: f"Product: {x['product name']} | Price: {x['price rec']} | PZN: {x['pzn']} | Size: {x['package size']} | Description: {x['descriptions']}", 
+    lambda x: f"Product: {x['product name']} | PZN: {x['pzn']} | Description: {x['descriptions']}", 
     axis=1
 )
 
 loader = DataFrameLoader(df, page_content_column="search_text")
-docs = loader.load()
 embeddings = OllamaEmbeddings(model="mxbai-embed-large")
-vectorstore = Chroma.from_documents(documents=docs, embedding=embeddings)
+vectorstore = Chroma.from_documents(documents=loader.load(), embedding=embeddings)
 retriever = vectorstore.as_retriever(search_kwargs={"k": 3})
 
-# --- 2. AGENT STATE ---
+# --- 3. AGENT STATE ---
 class AgentState(TypedDict):
     question: str
     context: List[str]
-    answer: str
+    # This will hold our structured Pydantic object
+    selection: ProductSelection 
 
-# --- 3. WORKFLOW NODES ---
+# --- 4. WORKFLOW NODES ---
+# Note: Ensure your local Ollama has llama3.2 or similar that supports tools/structured output
 llm = ChatOllama(model="llama3.2", temperature=0)
+structured_llm = llm.with_structured_output(ProductSelection)
 
 async def retrieve_inventory(state: AgentState):
-    # Standard invoke is fine here as retrieval is fast
     hits = await retriever.ainvoke(state["question"])
     return {"context": [h.page_content for h in hits]}
 
-async def generate_pharmacist_response(state: AgentState):
+async def generate_structured_response(state: AgentState):
     prompt = ChatPromptTemplate.from_template("""
-    You are a professional Pharmacist. Use the retrieved inventory context to answer the user's question.
-    Only recommend products found in the data below. Include prices.
+    You are a professional Pharmacist.
+    Based on the inventory context, extract the PZN numbers for the most relevant products.
     
-    Inventory Data:
+    Inventory:
     {context}
     
-    User Question: {question}
+    User Query: {question}
+    """)
     
-    Response:""")
-    
-    # We define the chain but call it using streaming in the execution block
-    chain = prompt | llm | StrOutputParser()
-    answer = await chain.ainvoke({"context": "\n".join(state["context"]), "question": state["question"]})
-    return {"answer": answer}
+    chain = prompt | structured_llm
+    result = await chain.ainvoke({"context": "\n".join(state["context"]), "question": state["question"]})
+    return {"selection": result}
 
-# --- 4. GRAPH CONSTRUCTION ---
+# --- 5. GRAPH ---
 builder = StateGraph(AgentState)
 builder.add_node("retrieve", retrieve_inventory)
-builder.add_node("generate", generate_pharmacist_response)
-
+builder.add_node("generate", generate_structured_response)
 builder.add_edge(START, "retrieve")
 builder.add_edge("retrieve", "generate")
-
 pharmacist_agent = builder.compile()
 
-# --- 5. TOKEN STREAMING EXECUTION ---
-# --- 5. TOKEN STREAMING EXECUTION ---
+# --- 6. EXECUTION ---
 async def start_chat():
-    query = "I need something for well being"
-    inputs = {"question": query}
-    
+    query = "i want skin care items"
     print(f"User: {query}")
-    print("Pharmacist: ", end="", flush=True)
-
-    async for event in pharmacist_agent.astream_events(inputs, version="v1"):
-        kind = event["event"]
-        
-        # 1. Check if the event is the specific streaming type
-        if kind == "on_chat_model_stream":
-            # 2. Use .get() to safely access data and chunk without type errors
-            data = event.get("data", {})
-            chunk = data.get("chunk")
-            
-            # 3. Verify chunk exists and has content attribute
-            if chunk and hasattr(chunk, "content"):
-                print(chunk.content, end="", flush=True)
+    
+    # We use invoke instead of astream_events because structured output 
+    # usually needs the full buffer to parse JSON correctly.
+    result = await pharmacist_agent.ainvoke({"question": query})
+    
+    selection = result["selection"]
+    print(selection)
+    print(f"\nPharmacist Reasoning: {selection.reasoning}")
+    print(f"Found PZNs: {selection.pzn_list}")
+    
+    # NEXT STEP LOGIC:
+    if selection.pzn_list:
+        chosen_pzn = selection.pzn_list[0] 
+        print(f"\nProceeding to compliance check for PZN: {chosen_pzn}...")
+        # Here you would call your compliance2_rag.py logic using chosen_pzn
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(start_chat())
-    except KeyboardInterrupt:
-        pass
+    asyncio.run(start_chat())

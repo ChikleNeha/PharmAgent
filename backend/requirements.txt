@@ -1,0 +1,13 @@
+fastapi
+uvicorn
+pandas
+openpyxl
+langchain
+langchain-ollama
+langchain-community
+langchain-chroma
+langgraph
+python-dotenv
+fpdf
+httpx
+pydantic

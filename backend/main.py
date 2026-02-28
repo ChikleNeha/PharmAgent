@@ -1,30 +1,121 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, UploadFile, File
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import JSONResponse
 from sqlalchemy import create_engine, MetaData, Table, select
+import json
+import tempfile
+import os
+import easyocr
+import re
+import json
+from typing import List, Dict
+from pharmacist_agent import pharmacist_agent
+from pydantic import BaseModel
+from typing import List, Optional
 
-app = FastAPI()
+# Import your agents/logic from your modular files
+from pharmacist_rag import pharmacist_agent  # Your Discovery RAG
+from pharmacy_master import app as pharmacy_graph # Your Master Workflow
 
-# Path to your database file
+app = FastAPI(title="AI Pharmacy API", version="1.0.0")
+
+# --- SCHEMA ---
+class UserQuery(BaseModel):
+    question: str
+    patient_id: Optional[str] = "CUST_001"
+
+class OrderRequest(BaseModel):
+    pzn: int
+    patient_id: str
+    daily_dosage: int = 1
+
+# --- ENDPOINTS ---
+
+@app.get("/")
+def home():
+    return {"message": "AI Pharmacy Agent API is Online"}
+
+@app.post("/search")
+async def search_medication(query: UserQuery):
+    """
+    Step 1: User asks a question, RAG returns relevant PZNs and descriptions.
+    """
+    try:
+        # Running your RAG Discovery Agent
+        result = await pharmacist_agent.ainvoke({"question": query.question})
+        
+        # Extract the structured selection we built earlier
+        return {
+            "pharmacist_answer": result.get("answer", ""),
+            "recommendations": result.get("context", []),
+            "structured_selection": result.get("selection") # Returns the PZN list
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/process-order")
+async def process_order(order: OrderRequest):
+    """
+    Step 2: User clicks a PZN. This triggers Compliance, Warehouse, and Refill.
+    """
+    try:
+        initial_state = {
+            "pzn": order.pzn,
+            "patient_id": order.patient_id,
+            "product_data": {},
+            "compliance_status": "pending",
+            "audit_reason": "",
+            "prediction_msg": ""
+        }
+        
+        # Execute the Master Graph
+        final_state = await pharmacy_graph.ainvoke(initial_state)
+        
+        return {
+            "status": final_state["compliance_status"],
+            "reason": final_state["audit_reason"],
+            "refill_prediction": final_state.get("prediction_msg", "No refill scheduled."),
+            "audit_pdf": f"audit_{order.pzn}.pdf"
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# Database setup (your existing code)
 DB_FILE = "./database/d1.db"
 DATABASE_URL = f"sqlite:///{DB_FILE}"
-
-# SQLAlchemy Setup
 engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
 metadata = MetaData()
-
-# This "Reflects" the tables created by your seed script automatically
 metadata.reflect(bind=engine)
+
 users_table = metadata.tables['users']
 orders_table = metadata.tables['orders']
 inventory_table = metadata.tables['inventory']
 
-# --- Endpoints ---
+# Serve frontend
+app.mount("/static", StaticFiles(directory="static"), name="static")
 
+# === WEB SPEECH API ENDPOINT (Processes transcribed text) ===
+@app.post("/process_speech/")
+async def process_speech(data: dict):
+    """Process text transcribed by browser Web Speech API"""
+    transcribed_text = data.get("transcript", "")
+    
+    if len(transcribed_text) > 3:
+        result = pharmacist_agent({"input_data": transcribed_text})
+        return {
+            "transcribed_text": transcribed_text,
+            "prescription_details": result["prescription_details"],
+            "status": "success"
+        }
+    return {"status": "no_speech", "message": "Too short"}
+
+# === YOUR DATABASE ENDPOINTS (unchanged) ===
 @app.get("/users")
 def read_users():
     with engine.connect() as conn:
         query = select(users_table)
         result = conn.execute(query)
-        # Convert rows to a list of dictionaries
         return [dict(row._mapping) for row in result]
 
 @app.get("/inventory")
@@ -40,48 +131,26 @@ def read_orders():
         query = select(orders_table)
         result = conn.execute(query)
         return [dict(row._mapping) for row in result]
-    
+
 @app.get("/inventory/low-stock")
 def check_stock():
-    """Returns products where stock is below 50"""
     with engine.connect() as conn:
         stmt = select(inventory_table).where(inventory_table.c.stock < 50)
         result = conn.execute(stmt)
         return [dict(row._mapping) for row in result]
-# # --- Input Schema ---
-# class UserQuery(BaseModel):
-#     query: str
-
-# def query_db(search_term: str): 
-#     conn = sqlite3.connect(DATABASE_URL) 
-#     cursor = conn.cursor()
-#     cursor.execute("SELECT * FROM inventory WHERE product_name LIKE ?", ('%' + search_term + '%',))
-#     results = cursor.fetchall()
 
 @app.get("/inventory/{product_id}")
 def get_product_by_id(product_id: int):
-    """
-    Fetch a single product's details and stock level by its ID.
-    """
     with engine.connect() as conn:
-        # Construct the query: SELECT * FROM inventory WHERE product_id = :product_id
         stmt = select(inventory_table).where(inventory_table.c.product_id == product_id)
         result = conn.execute(stmt).mappings().first()
-    
-    # If no product is found with that ID, return a 404 error
     if not result:
-        raise HTTPException(
-            status_code=404, 
-            detail=f"Product with ID {product_id} not found"
-        )
-    
+        raise HTTPException(status_code=404, detail=f"Product with ID {product_id} not found")
     return dict(result)
 
 @app.get("/patient/{patient_id}/history")
 def get_patient_history(patient_id: str):
-    """Returns patient details and all their orders joined together"""
     with engine.connect() as conn:
-        # Perform a SQL JOIN using SQLAlchemy
         stmt = (
             select(orders_table, users_table.c.patient_age, users_table.c.patient_gender)
             .join(users_table, orders_table.c.patient_id == users_table.c.patient_id)
@@ -89,8 +158,10 @@ def get_patient_history(patient_id: str):
         )
         result = conn.execute(stmt)
         data = [dict(row._mapping) for row in result]
-        
     if not data:
         raise HTTPException(status_code=404, detail="Patient history not found")
     return data
 
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
