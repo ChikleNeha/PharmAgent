@@ -13,10 +13,11 @@ async def compliance_node(state):
     
     # Prescription Check (Example: PZN divisible by 5)
     if pzn % 5 == 0:
-        print(f"\n[ALERT] {prod['product name']} requires Prescription.")
-        choice = input("Admin, approve order? (yes/no): ").lower()
-        if choice == "yes":
-            return {"product_data": prod, "compliance_status": "approved", "audit_reason": "Manual Rx Approved."}
-        return {"product_data": prod, "compliance_status": "rejected", "audit_reason": "Rx Denied."}
+        # Instead of input(), we just set a flag and the graph will pause
+        return {
+            "product_data": prod, 
+            "compliance_status": "pending_admin", 
+            "audit_reason": "Waiting for prescription verification."
+        }
     
     return {"product_data": prod, "compliance_status": "approved", "audit_reason": "OTC Approved."}
