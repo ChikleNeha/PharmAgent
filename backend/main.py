@@ -1,11 +1,5 @@
 from fastapi import FastAPI, HTTPException
 from sqlalchemy import create_engine, MetaData, Table, select
-import os
-from pydantic import BaseModel
-# from agents.pharmacist_agent import extract_keywords, pharmacist_agent
-import sqlite3
-
-# from agents.pharmacist_agent import extract_keywords
 
 app = FastAPI()
 
@@ -47,26 +41,41 @@ def read_orders():
         result = conn.execute(query)
         return [dict(row._mapping) for row in result]
     
+@app.get("/inventory/low-stock")
+def check_stock():
+    """Returns products where stock is below 50"""
+    with engine.connect() as conn:
+        stmt = select(inventory_table).where(inventory_table.c.stock < 50)
+        result = conn.execute(stmt)
+        return [dict(row._mapping) for row in result]
+# # --- Input Schema ---
+# class UserQuery(BaseModel):
+#     query: str
 
-# --- Input Schema ---
-class UserQuery(BaseModel):
-    query: str
+# def query_db(search_term: str): 
+#     conn = sqlite3.connect(DATABASE_URL) 
+#     cursor = conn.cursor()
+#     cursor.execute("SELECT * FROM inventory WHERE product_name LIKE ?", ('%' + search_term + '%',))
+#     results = cursor.fetchall()
 
-def query_db(search_term: str): 
-    conn = sqlite3.connect(DATABASE_URL) 
-    cursor = conn.cursor()
-
-from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel
-from agents.pharmacist_agent import pharmacist_agent
-
-# router = APIRouter()
-
-class ChatRequest(BaseModel):
-    user_id: str
-    message: str  # Can be transcribed text from voice or direct text input 
-
-
+@app.get("/inventory/{product_id}")
+def get_product_by_id(product_id: int):
+    """
+    Fetch a single product's details and stock level by its ID.
+    """
+    with engine.connect() as conn:
+        # Construct the query: SELECT * FROM inventory WHERE product_id = :product_id
+        stmt = select(inventory_table).where(inventory_table.c.product_id == product_id)
+        result = conn.execute(stmt).mappings().first()
+    
+    # If no product is found with that ID, return a 404 error
+    if not result:
+        raise HTTPException(
+            status_code=404, 
+            detail=f"Product with ID {product_id} not found"
+        )
+    
+    return dict(result)
 
 @app.get("/patient/{patient_id}/history")
 def get_patient_history(patient_id: str):
@@ -85,10 +94,3 @@ def get_patient_history(patient_id: str):
         raise HTTPException(status_code=404, detail="Patient history not found")
     return data
 
-@app.get("/inventory/low-stock")
-def check_stock():
-    """Returns products where stock is below 50"""
-    with engine.connect() as conn:
-        stmt = select(inventory_table).where(inventory_table.c.stock < 50)
-        result = conn.execute(stmt)
-        return [dict(row._mapping) for row in result]
