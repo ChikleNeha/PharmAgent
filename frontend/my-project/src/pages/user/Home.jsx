@@ -54,7 +54,7 @@ export default function Home() {
       <p className="text-green-dark font-bold text-[15px]">₹499</p>
       <div className="flex justify-between mt-3 pt-2 border-t border-gray-100">
         <span className="cursor-pointer text-[20px] text-red-500 hover:text-red-600 transition-colors group-hover:animate-pulse">♡</span>
-        <span className="text-yellow-400 text-[16px]">⭐⭐⭐⭐⭐</span>
+        <span className="text-yellow-400 text-[16px]">✦</span>
       </div>
     </div>
   );
