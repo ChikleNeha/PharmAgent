@@ -47,8 +47,6 @@ def read_orders():
         result = conn.execute(query)
         return [dict(row._mapping) for row in result]
     
-class ChatRequest(BaseModel):
-    message: str
 
 # --- Input Schema ---
 class UserQuery(BaseModel):
@@ -58,22 +56,16 @@ def query_db(search_term: str):
     conn = sqlite3.connect(DATABASE_URL) 
     cursor = conn.cursor()
 
-# --- Pharmacist Agent Endpoint ---
-# @app.post("/pharmacist")
-# def pharmacist_agent(user_query: UserQuery):
-#     # Step 1: Extract keywords from messy input
-#     keywords = extract_keywords(user_query.query)
+from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel
+from agents.pharmacist_agent import pharmacist_agent
 
-#     # Step 2: Query DB for each keyword
-#     all_results = []
-#     for kw in keywords:
-#         matches = query_db(kw)
-#         all_results.extend(matches)
+# router = APIRouter()
 
-#     # Step 3: Return results
-#     if not all_results:
-#         return {"message": "No matching medicines found."}
-#     return {"matches": all_results}
+class ChatRequest(BaseModel):
+    user_id: str
+    message: str  # Can be transcribed text from voice or direct text input 
+
 
 
 @app.get("/patient/{patient_id}/history")
