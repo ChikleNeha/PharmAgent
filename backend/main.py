@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, UploadFile, File
+from fastapi import FastAPI, HTTPException, UploadFile, File,Body
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import JSONResponse
 from sqlalchemy import create_engine, MetaData, Table, select
@@ -12,6 +12,7 @@ from typing import List, Dict
 from pharmacist_agent import pharmacist_agent
 from pydantic import BaseModel
 from typing import List, Optional
+from langgraph.checkpoint.sqlite import SqliteSaver
 
 # Import your agents/logic from your modular files
 from pharmacist_rag import pharmacist_agent  # Your Discovery RAG
@@ -53,33 +54,45 @@ async def search_medication(query: UserQuery):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+
+
+# Setup Persistence (This saves the state so we can resume later)
+memory = SqliteSaver.from_conn_string(":memory:")
+app_graph = pharmacy_graph.compile(checkpointer=memory, interrupt_before=["warehouse"])
+
 @app.post("/process-order")
 async def process_order(order: OrderRequest):
-    """
-    Step 2: User clicks a PZN. This triggers Compliance, Warehouse, and Refill.
-    """
-    try:
-        initial_state = {
-            "pzn": order.pzn,
-            "patient_id": order.patient_id,
-            "product_data": {},
-            "compliance_status": "pending",
-            "audit_reason": "",
-            "prediction_msg": ""
-        }
-        
-        # Execute the Master Graph
-        final_state = await pharmacy_graph.ainvoke(initial_state)
-        
+    # We provide a thread_id so we can find this specific order later
+    config = {"configurable": {"thread_id": str(order.pzn)}} 
+    
+    initial_state = {"pzn": order.pzn, "patient_id": order.patient_id}
+    
+    # Start the graph
+    result = await app_graph.ainvoke(initial_state, config)
+    
+    # Check if the graph paused for review
+    snapshot = await app_graph.get_state(config)
+    if snapshot.next:
         return {
-            "status": final_state["compliance_status"],
-            "reason": final_state["audit_reason"],
-            "refill_prediction": final_state.get("prediction_msg", "No refill scheduled."),
-            "audit_pdf": f"audit_{order.pzn}.pdf"
+            "status": "AWAITING_ADMIN",
+            "message": "This medication requires admin approval.",
+            "thread_id": order.pzn
         }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    
+    return {"status": "SUCCESS", "details": result}
 
+@app.post("/admin/approve")
+async def admin_approve(thread_id: str = Body(..., embed=True)):
+    """The 'Resume' Button on the Frontend calls this."""
+    config = {"configurable": {"thread_id": thread_id}}
+    
+    # Manually update the state to 'approved'
+    await app_graph.update_state(config, {"compliance_status": "approved"})
+    
+    # Resume the graph (it will now run the warehouse and predictive nodes)
+    final_result = await app_graph.ainvoke(None, config)
+    
+    return {"status": "ORDER_COMPLETED", "prediction": final_result.get("prediction_msg")}
 
 # Database setup (your existing code)
 DB_FILE = "./database/d1.db"
