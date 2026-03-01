@@ -55,6 +55,27 @@ from thefuzz import process
 import easyocr
 from fastapi import UploadFile, File
 
+from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from typing import Dict, Any, List, TypedDict
+from langgraph.graph import StateGraph, END
+from langchain_ollama import ChatOllama
+from langsmith import traceable
+from PIL import Image, ImageEnhance
+import base64
+import io
+import os
+import pytesseract
+import re
+import pandas as pd
+from rapidfuzz import fuzz, process
+from dotenv import load_dotenv
+import json
+
+load_dotenv()
+
+app = FastAPI(title="Prescription Extractor - Llama3.2 Text Only")
 
 # Define allowed origins
 origins = [
@@ -309,6 +330,262 @@ def read_orders():
         result = conn.execute(query)
         return [dict(row._mapping) for row in result]
 
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+os.environ["LANGCHAIN_TRACING_V2"] = "true"
+os.environ["LANGCHAIN_PROJECT"] = "prescription-extractor-text-only"
+
+# Common Indian medicine names for fuzzy matching (expand as needed)
+COMMON_MEDS = [
+    "paracetamol", "ibuprofen", "amoxicillin", "azithromycin", "cetirizine",
+    "montelukast", "atorvastatin", "amlodipine", "metformin", "pantoprazole",
+    "rabeprazole", "levocetirizine", "levofloxacin", "ciprofloxacin", "doxycycline",
+    "sertraline", "escitalopram", "clobazam", "alprazolam", "lorazepam"
+]
+
+class PrescriptionState(TypedDict):
+    image_path: str
+    ocr_text: str
+    cleaned_text: str
+    structured_data: Dict[str, Any]
+    confidence: float
+    matched_meds: List[str]
+
+@traceable
+def preprocess_image(state: PrescriptionState) -> PrescriptionState:
+    """Enhance image for better OCR"""
+    image = Image.open(io.BytesIO(open(state['image_path'], 'rb').read()))
+    
+    # Convert to grayscale and enhance
+    if image.mode != 'L':
+        image = image.convert('L')
+    
+    enhancer = ImageEnhance.Contrast(image)
+    image = enhancer.enhance(2.0)
+    enhancer = ImageEnhance.Sharpness(image)
+    image = enhancer.enhance(2.0)
+    
+    image.save(state['image_path'])
+    return state
+
+@traceable
+def ocr_node(state: PrescriptionState) -> PrescriptionState:
+    """Extract text using Tesseract OCR"""
+    # Preprocess for better OCR
+    state = preprocess_image(state)
+    
+    custom_config = r'--oem 3 --psm 6 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789.,/()- '
+    text = pytesseract.image_to_string(
+        Image.open(state['image_path']), 
+        config=custom_config
+    )
+    
+    state["ocr_text"] = text.strip()
+    return state
+
+@traceable
+def clean_and_extract_node(state: PrescriptionState) -> PrescriptionState:
+    """Clean OCR text and extract basic entities"""
+    text = state["ocr_text"].lower()
+    
+    # Clean text
+    lines = [line.strip() for line in text.split('\n') if line.strip()]
+    cleaned = ' '.join(lines)
+    
+    state["cleaned_text"] = cleaned
+    
+    # Simple regex extraction
+    patient_match = re.search(r'(?:patient|name|mr|mrs|ms)\s*:?\s*([a-zA-Z\s]+?)(?:\n|$)', text, re.IGNORECASE)
+    patient_name = patient_match.group(1).strip() if patient_match else "Not found"
+    
+    date_match = re.search(r'\d{1,2}[/-]\d{1,2}[/-]\d{2,4}|\d{1,2}\s+(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)', text, re.IGNORECASE)
+    date = date_match.group(0) if date_match else "Not found"
+    
+    state["structured_data"] = {
+        "patient": {"name": patient_name},
+        "date": date,
+        "medications": [],
+        "raw_ocr": state["ocr_text"]
+    }
+    
+    return state
+
+import numpy as np
+from PIL import Image
+import io
+from thefuzz import process
+import easyocr
+from fastapi import UploadFile, File
+
+# Initialize the reader
+reader = easyocr.Reader(['en']) 
+
+@tracable
+@app.post("/scan-prescription")
+async def scan_prescription(file: UploadFile = File(...)):
+    # 1. Load the image
+    contents = await file.read()
+    image = Image.open(io.BytesIO(contents))
+    
+    # 2. Convert to OCR text
+    # This captures the raw strings exactly as they appear
+    raw_results = reader.readtext(np.array(image), detail=0)
+    full_text_blob = " ".join(raw_results)
+    
+    # 3. Perform Fuzzy Matching
+    found_meds = []
+    # We look at each word the OCR found
+    for word in full_text_blob.split():
+        if len(word) < 4: continue
+        
+        # Match against your Excel product list
+        best_match, score = process.extractOne(word, ALL_PRODUCT_NAMES)
+        
+        if score > 80: # 80% is the 'sweet spot' for accuracy
+            med_data = df[df['product name'] == best_match].iloc[0]
+            found_meds.append({
+                "original_word_in_image": word, # <--- This is what was actually read
+                "matched_name": best_match,
+                "pzn": int(med_data['pzn']),
+                "accuracy_score": score
+            })
+
+    # Return everything for you to check
+    return {
+        "verification": {
+            "total_raw_text_detected": full_text_blob,
+            "detected_chunks": raw_results
+        },
+        "identified_medicines": found_meds
+    }
+
+@traceable
+def fuzzy_med_matching(state: PrescriptionState) -> PrescriptionState:
+    """Fuzzy match medicine names using rapidfuzz"""
+    text_words = re.findall(r'\b[a-zA-Z]{3,20}\b', state["cleaned_text"])
+    
+    meds = []
+    for word in text_words:
+        # Fuzzy match against common meds
+        match = process.extractOne(word, COMMON_MEDS, scorer=fuzz.ratio, score_cutoff=75)
+        if match:
+            meds.append({
+                "extracted": word,
+                "matched": match[0],
+                "confidence": match[1] / 100.0
+            })
+    
+    # Dosage patterns
+    dosage_patterns = [
+        r'(\d+(?:\.\d+)?)\s*(mg|mcg|gm|ml|tab|caps?|bd|tds|qid|od|hs)',
+        r'(tab|caps?)\s*\d+',
+        r'\d+\s*(?:tab|caps?)',
+    ]
+    
+    dosages = []
+    for pattern in dosage_patterns:
+        dosages.extend(re.findall(pattern, state["cleaned_text"], re.IGNORECASE))
+    
+    state["matched_meds"] = meds
+    state["structured_data"]["medications"] = [
+        {"name": med["matched"], "dosage": "TBD", "confidence": med["confidence"]}
+        for med in meds[:5]  # Top 5 matches
+    ]
+    state["confidence"] = min(0.95, len(meds) * 0.2 + 0.3)
+    
+    return state
+
+@traceable
+def llm_refine_node(state: PrescriptionState) -> PrescriptionState:
+    """Use llama3.2:1b to refine and structure final output"""
+    llm = ChatOllama(model="llama3.2:1b", temperature=0.1)
+    
+    prompt = f"""
+    Given this OCR text from a prescription and fuzzy matched medicines, create structured JSON:
+
+    OCR Text: {state['cleaned_text'][:1000]}
+    
+    Fuzzy Matches: {json.dumps(state['matched_meds'])}
+    
+    Return ONLY valid JSON in this exact format:
+    {{
+        "patient": {{"name": "string"}},
+        "doctor": {{"name": "string|not found"}},
+        "medications": [
+            {{
+                "name": "exact_med_name",
+                "dosage": "dosage_info|unknown",
+                "frequency": "bd|tds|qid|unknown",
+                "duration": "string|unknown",
+                "confidence": 0.0-1.0
+            }}
+        ],
+        "date": "string|not found",
+        "confidence_score": 0.0-1.0
+    }}
+    """
+    
+    response = llm.invoke(prompt)
+    
+    try:
+        refined_data = json.loads(response.content)
+        state["structured_data"].update(refined_data)
+    except:
+        pass  # Keep fuzzy matched data
+    
+    return state
+
+# Build LangGraph workflow
+workflow = StateGraph(PrescriptionState)
+workflow.add_node("ocr", ocr_node)
+workflow.add_node("clean_extract", clean_and_extract_node)
+workflow.add_node("fuzzy_match", fuzzy_med_matching)
+workflow.add_node("llm_refine", llm_refine_node)
+
+workflow.set_entry_point("ocr")
+workflow.add_edge("ocr", "clean_extract")
+workflow.add_edge("clean_extract", "fuzzy_match")
+workflow.add_edge("fuzzy_match", "llm_refine")
+workflow.add_edge("llm_refine", END)
+
+prescription_graph = workflow.compile()
+
+class PrescriptionResponse(BaseModel):
+    data: Dict[str, Any]
+    confidence: float
+    ocr_text: str
+    matched_medicines: List[str]
+
+@app.post("/api/extract-prescription")
+async def extract_prescription(file: UploadFile = File(...)):
+    if not file.content_type.startswith('image/'):
+        raise HTTPException(400, "Only image files allowed")
+    
+    # Save uploaded file
+    file_path = f"/tmp/{file.filename}"
+    with open(file_path, "wb") as f:
+        contents = await file.read()
+        f.write(contents)
+    
+    result = prescription_graph.invoke({"image_path": file_path})
+    
+    return PrescriptionResponse(
+        data=result["structured_data"],
+        confidence=result.get("confidence", 0.5),
+        ocr_text=result["ocr_text"],
+        matched_medicines=[m["matched"] for m in result.get("matched_meds", [])]
+    )
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
 
 
 @app.get("/inventory/low-stock")
