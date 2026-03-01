@@ -1,0 +1,57 @@
+async function extractMedicines() {
+    const fileInput = document.getElementById('imageInput');
+    const file = fileInput.files[0];
+    if (!file) return alert('Select image');
+    
+    const formData = new FormData();
+    formData.append('file', file);
+    
+    const resultDiv = document.getElementById('result');
+    resultDiv.innerHTML = '<p>Processing...</p>';
+    
+    try {
+        const response = await fetch('/extract-medicines/', {
+            method: 'POST',
+            body: formData
+        });
+        
+        // Debug: Show status and headers
+        console.log('Status:', response.status);
+        console.log('Headers:', [...response.headers.entries()]);
+        
+        const text = await response.text();
+        console.log('Raw response:', text);
+        
+        if (!text.trim()) {
+            throw new Error('Empty response');
+        }
+        
+        const data = JSON.parse(text);
+        
+        // Render as before...
+        let html = `
+            <h2>✅ Extracted Data</h2>
+            <p><strong>Patient:</strong> ${data.patient_name || 'N/A'}</p>
+            <p><strong>Doctor:</strong> ${data.doctor_name || 'N/A'}</p>
+            <p><strong>Total Medicines:</strong> ${data.total_medicines || 0}</p>
+            <table>
+                <thead><tr><th>Drug</th><th>Dosage</th><th>Instructions</th></tr></thead>
+                <tbody>
+        `;
+        (data.medicines || []).forEach(med => {
+            html += `<tr><td>${med.drug_name}</td><td>${med.dosage}</td><td>${med.instructions}</td></tr>`;
+        });
+        html += '</tbody></table><details><summary>Raw OCR</summary><pre>' + (data.raw_ocr || '') + '</pre></details>';
+        
+        resultDiv.innerHTML = html;
+        
+    } catch (error) {
+        resultDiv.innerHTML = `
+            <h2>❌ Error</h2>
+            <p>${error.message}</p>
+            <details><summary>Debug Info</summary>
+                <p>Check browser console (F12) for "Raw response" and server terminal for OCR logs.</p>
+            </details>
+        `;
+    }
+}
